@@ -4,8 +4,9 @@ import { jsonrepair } from 'jsonrepair';
 import { z } from 'zod';
 
 /**
- * Forward agent text-delta and reasoning-delta chunks to the workflow writer
- * for real-time streaming to the client.
+ * Forward agent text-delta and reasoning-delta chunks to the workflow writer.
+ * Text is buffered so that the ###JSON:{...} metadata marker and everything
+ * after it is silently dropped — the client only sees the conversational reply.
  */
 async function pipeStreamToWriter(
   output: MastraModelOutput | undefined,
@@ -13,13 +14,36 @@ async function pipeStreamToWriter(
   runId: string,
 ) {
   if (!output || !writer) return;
+  const JSON_MARKER = '###JSON:';
+  // Hold back the last (MARKER_LEN - 1) chars so a marker split across chunks
+  // is always detected before being flushed to the client.
+  const HOLD = JSON_MARKER.length - 1;
+  let held = '';
+  let stopped = false;
+
   const reader = output.fullStream.getReader();
   try {
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
+
       if (value.type === 'text-delta') {
-        await writer.write((value as { type: 'text-delta'; payload: { text: string } }).payload.text);
+        if (stopped) continue; // drain stream but never write after marker
+        held += (value as { type: 'text-delta'; payload: { text: string } }).payload.text;
+
+        const markerIdx = held.indexOf(JSON_MARKER);
+        if (markerIdx !== -1) {
+          const safe = held.slice(0, markerIdx).trimEnd();
+          if (safe) await writer.write(safe);
+          stopped = true;
+        } else {
+          // Flush all but the last HOLD chars (guard against split marker)
+          const flushUpTo = held.length - HOLD;
+          if (flushUpTo > 0) {
+            await writer.write(held.slice(0, flushUpTo));
+            held = held.slice(flushUpTo);
+          }
+        }
       } else if (value.type === 'reasoning-delta') {
         await writer.custom({
           type: 'reasoning-delta',
@@ -30,6 +54,13 @@ async function pipeStreamToWriter(
       }
     }
   } finally {
+    // Flush any buffered chars that never triggered the marker
+    if (!stopped && held) {
+      const markerIdx = held.indexOf(JSON_MARKER);
+      const end = markerIdx !== -1 ? markerIdx : held.length;
+      const safe = held.slice(0, end).trimEnd();
+      if (safe) await writer.write(safe);
+    }
     reader.releaseLock();
   }
 }
@@ -138,24 +169,144 @@ const destinationStep = createStep({
   },
 });
 
-// ─── Step 2: Attraction Selection (claude-opus-4-7 + thinking) ─────────────
-const STEP2_INSTRUCTIONS = (destination: string) => `You are a travel planning assistant in PHASE 2: ATTRACTION SELECTION.
-Destination confirmed: ${destination}
+// ─── Step 2a: Attraction Planning (Opus 4.7 — strategic, no overlap) ────────
+const attractionBriefSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  brief: z.string(),
+});
+type AttractionBrief = z.infer<typeof attractionBriefSchema>;
 
-Your goal: suggest 6–8 must-see attractions for this destination.
+// attractionPlanOutputSchema is the Zod contract for the Opus planning step.
+// Passed as `output` to agent.generate() — model is forced to conform to this
+// shape (same principle as Pydantic BaseModel in Python).
+const attractionPlanOutputSchema = z.object({
+  attractions: z
+    .array(
+      z.object({
+        id: z.string().describe('Sequential identifier starting from "1"'),
+        name: z.string().describe('Full attraction name'),
+        brief: z.string().describe('1-2 sentences explaining what makes this attraction unique'),
+      }),
+    )
+    .describe('6-8 diverse, non-overlapping attractions'),
+});
 
-FIRST call (no prior selections): Generate the initial suggestion list with descriptions, then end with:
-###JSON:{"phase":"suggest","cards":[{"id":"1","name":"...","description":"...","category":"nature|culture|food|shopping|activity|other"},{"id":"2",...},...]}
+const STEP2_PLAN_INSTRUCTIONS = (destination: string) =>
+  `You are a travel attraction planning specialist.
+Destination: ${destination}
 
-RESUME call (user has responded with selections or text): Review what they selected/said, confirm the final list, then end with:
-###JSON:{"phase":"confirmed","selected":["attraction name 1","attraction name 2",...]}
+Plan a diverse, non-overlapping list of 6-8 must-see attractions.
+Requirements:
+- Each attraction must offer a DIFFERENT experience (no two should feel the same)
+- Mix categories: nature, culture, food, shopping, activity
+- Cover different geographic areas of the destination when possible`;
 
-If the user wants different options, provide updated suggestions and end with another ###JSON:{"phase":"suggest","cards":[...]} block.
-Always end every response with the ###JSON line.`;
-
-const attractionsStep = createStep({
-  id: 'attraction-selection',
+const attractionPlanStep = createStep({
+  id: 'attraction-plan',
   inputSchema: z.object({ destination: z.string() }),
+  outputSchema: z.object({
+    destination: z.string(),
+    attractions: z.array(attractionBriefSchema),
+  }),
+  execute: async ({ inputData, mastra, runId, writer }) => {
+    const { destination } = inputData;
+
+    // Let the user know we're working — card generation takes 30-60 s
+    await writer?.write(`🗺️ 正在为 **${destination}** 规划景点清单，并发生成推荐卡片，请稍候…`);
+
+    const agent = mastra?.getAgent('attractionPlannerAgent');
+
+    const MAX_RETRIES = 3;
+    let attractions: AttractionBrief[] = [];
+    let lastError: unknown;
+
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        const result = await agent?.generate(
+          [{ role: 'user' as const, content: `请为 ${destination} 规划 6-8 个多样化、无重叠的景点清单。` }],
+          {
+            instructions: STEP2_PLAN_INSTRUCTIONS(destination),
+            memory: { thread: `travel-${runId}`, resource: 'travel-workflow-user' },
+            // Zod schema enforces structured output — equivalent to Pydantic BaseModel
+            structuredOutput: { schema: attractionPlanOutputSchema },
+            ...THINKING_OPTIONS_OPUS,
+          },
+        );
+        attractions = (result?.object?.attractions ?? []).map((a: AttractionBrief) => ({
+          id: a.id,
+          name: a.name,
+          brief: a.brief,
+        }));
+        break; // success — exit retry loop
+      } catch (err) {
+        lastError = err;
+        if (attempt < MAX_RETRIES) {
+          await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
+        }
+      }
+    }
+
+    if (attractions.length === 0 && lastError) {
+      throw lastError; // all retries exhausted — surface the error
+    }
+
+    return { destination, attractions };
+  },
+});
+
+// ─── Step 2b: Card Generation (Sonnet — one card, runs 8 in parallel) ───────
+//
+// cardContentSchema is the Zod-based "Pydantic" contract we pass to the model.
+// Mastra's `output` param enforces this via JSON mode / tool-calling — no
+// manual JSON.parse or regex cleanup needed.
+const cardContentSchema = z.object({
+  name: z.string().describe('Full name of the attraction'),
+  description: z
+    .string()
+    .describe('2-3 sentences: what makes it special, top activities, and one practical tip'),
+  category: z
+    .enum(['nature', 'culture', 'food', 'shopping', 'activity', 'other'])
+    .describe('Attraction type — must be exactly one of the enum values'),
+});
+
+const STEP2_CARD_INSTRUCTIONS = `You are a travel card writer.
+Given an attraction name, its destination city, and a brief context, write a compelling attraction card.
+Focus on what makes it unique and what visitors should do or know.`;
+
+const generateCardStep = createStep({
+  id: 'generate-card',
+  inputSchema: z.object({
+    id: z.string(),
+    name: z.string(),
+    brief: z.string(),
+    destination: z.string(),
+  }),
+  outputSchema: attractionCardSchema,
+  execute: async ({ inputData, mastra, runId }) => {
+    const { id, name, brief, destination } = inputData;
+    try {
+      const agent = mastra?.getAgent('travelPlannerAgent');
+      const result = await agent?.generate(
+        [{ role: 'user' as const, content: `Attraction: ${name}\nDestination: ${destination}\nContext: ${brief}` }],
+        {
+          instructions: STEP2_CARD_INSTRUCTIONS,
+          memory: { thread: `card-gen-${runId}-${id}`, resource: 'travel-workflow-user' },
+          // Zod schema enforces the output structure — equivalent to Pydantic in Python
+          structuredOutput: { schema: cardContentSchema },
+        },
+      );
+      const obj = result?.object;
+      if (obj) return { id, name: obj.name, description: obj.description, category: obj.category };
+    } catch { /* fall through to safe default */ }
+    return { id, name, description: brief, category: 'other' as const };
+  },
+});
+
+// ─── Step 2c: Collect Cards + Suspend/Resume ────────────────────────────────
+const collectCardsStep = createStep({
+  id: 'attraction-selection', // same ID keeps frontend resume logic unchanged
+  inputSchema: z.array(attractionCardSchema),
   outputSchema: z.object({ selectedAttractions: z.array(z.string()) }),
   resumeSchema: z.object({
     selectedCards: z.array(z.string()),
@@ -169,56 +320,26 @@ const attractionsStep = createStep({
   }),
   stateSchema: z.object({
     destination: z.string().optional(),
-    attractions: z.array(attractionCardSchema).optional(),
     selectedAttractions: z.array(z.string()).optional(),
+    itineraryGenerated: z.boolean().optional(),
   }),
-  execute: async ({ inputData, resumeData, suspend, state, setState, mastra, runId }) => {
-    const destination = inputData.destination;
-
-    let userTurn: string;
+  execute: async ({ inputData, resumeData, suspend, state, setState }) => {
     if (!resumeData) {
-      userTurn = `请为 ${destination} 推荐值得游览的景点。`;
-    } else {
-      const parts: string[] = [];
-      if (resumeData.selectedCards.length > 0) {
-        parts.push(`我选择了这些景点：${resumeData.selectedCards.join('、')}`);
-      }
-      if (resumeData.userMessage?.trim()) {
-        parts.push(resumeData.userMessage.trim());
-      }
-      userTurn = parts.join('\n') || '没有特别偏好，请按您的建议来。';
+      // First execution: all cards are ready — push them to the user
+      const cards = inputData as AttractionCard[];
+      const reply = `以下是为您精心规划的 ${cards.length} 个景点推荐！请点击卡片选择感兴趣的景点，也可以在输入框中说明偏好或补充想去的地方。`;
+      return await suspend({ reply, stepName: 'attractions', cards });
     }
 
-    // claude-opus-4-7 via attractionPlannerAgent — generate (not stream) to get full JSON
-    const agent = mastra?.getAgent('attractionPlannerAgent');
-    const result = await agent?.generate(
-      [{ role: 'user' as const, content: userTurn }],
-      {
-        instructions: STEP2_INSTRUCTIONS(destination),
-        memory: { thread: `travel-${runId}`, resource: 'travel-workflow-user' },
-        ...THINKING_OPTIONS_OPUS,
-      },
-    );
-
-    const fullText = result?.text ?? '';
-    const reasoningText = (await result?.reasoningText) ?? undefined;
-    const { reply, meta } = parseAgentResponse(fullText);
-
-    if (meta.phase === 'confirmed' && Array.isArray(meta.selected)) {
-      const selected = meta.selected as string[];
-      await setState({ ...state, selectedAttractions: selected });
-      return { selectedAttractions: selected };
+    // Resume: collect selected cards + any free-text supplement
+    const selected: string[] = [...resumeData.selectedCards];
+    if (resumeData.userMessage?.trim()) {
+      selected.push(resumeData.userMessage.trim());
     }
+    const finalSelection = selected.length > 0 ? selected : ['（无特别偏好，请按推荐安排）'];
 
-    let cards: AttractionCard[] = [];
-    if (Array.isArray(meta.cards)) {
-      cards = (meta.cards as unknown[]).filter((c): c is AttractionCard =>
-        typeof c === 'object' && c !== null && 'id' in c && 'name' in c,
-      );
-      await setState({ ...state, attractions: cards });
-    }
-
-    return await suspend({ reply, stepName: 'attractions', cards, thinking: reasoningText });
+    await setState({ ...state, selectedAttractions: finalSelection });
+    return { selectedAttractions: finalSelection };
   },
 });
 
@@ -327,11 +448,21 @@ export const travelPlannerWorkflow = createWorkflow({
   outputSchema: z.object({ itinerary: z.string() }),
   stateSchema: z.object({
     destination: z.string().optional(),
-    attractions: z.array(attractionCardSchema).optional(),
     selectedAttractions: z.array(z.string()).optional(),
+    itineraryGenerated: z.boolean().optional(),
   }),
 })
   .then(destinationStep)
-  .then(attractionsStep)
+  .then(attractionPlanStep)
+  .map(async ({ inputData }) =>
+    inputData.attractions.map((a: AttractionBrief) => ({
+      id: a.id,
+      name: a.name,
+      brief: a.brief,
+      destination: inputData.destination,
+    })),
+  )
+  .foreach(generateCardStep, { concurrency: 8 })
+  .then(collectCardsStep)
   .then(itineraryStep)
   .commit();
